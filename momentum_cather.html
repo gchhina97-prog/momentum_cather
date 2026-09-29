@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Momentum Catcher (HTML)</title>
+  <style>
+    body { background: #0e1117; color: #c9d1d9; font-family: 'Courier New', monospace; margin: 0; padding: 20px; }
+    h1 { color: #58a6ff; }
+    .controls { margin-bottom: 20px; }
+    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 8px 16px; cursor: pointer; border-radius: 6px; margin-right: 8px; }
+    button:hover { background: #30363d; }
+    #log { background: #161b22; border: 1px solid #30363d; padding: 15px; height: 200px; overflow-y: auto; font-size: 13px; white-space: pre-wrap; margin-bottom: 20px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #30363d; }
+    th { color: #8b949e; }
+    .pick { color: #3fb950; font-weight: bold; }
+    .skip { color: #8b949e; }
+    .positive { color: #3fb950; }
+    .negative { color: #f85149; }
+  </style>
+</head>
+<body>
+  <h1>⚡ Momentum Catcher (Browser Edition)</h1>
+  <div class="controls">
+    <button id="scanBtn">Scan Now</button>
+    <button id="autoBtn">Auto: OFF</button>
+    <button id="downloadBtn">Download JSON</button>
+    <span id="status">Idle</span>
+  </div>
+  <div id="log">Ready.</div>
+  <table id="results">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Price</th>
+        <th>24h%</th>
+        <th>Vol Accel</th>
+        <th>RSI</th>
+        <th>Score</th>
+        <th>Signal</th>
+        <th>TP</th>
+        <th>SL</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <script>
+    const FAPI = 'https://fapi.binance.com';
+    const TOP_N = 80; // Max symbols to scan
+    let autoInterval = null;
+
+    const logEl = document.getElementById('log');
+    const tbody = document.querySelector('#results tbody');
+    const statusEl = document.getElementById('status');
+
+    function log(msg) {
+      const time = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      logEl.textContent += `\n[${time}] ${msg}`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+
+    function calcRSI(closes, period = 14) {
+      if (closes.length < period + 1) return 50;
+      let gains = 0, losses = 0;
+      for (let i = closes.length - period; i < closes.length; i++) {
+        const diff = closes[i] - closes[i - 1];
+        if (diff > 0) gains += diff;
+        else losses -= diff;
+      }
+      const avgGain = gains / period;
+      const avgLoss = losses / period;
+      if (avgLoss === 0) return 100;
+      const rs = avgGain / avgLoss;
+      return 100 - (100 / (1 + rs));
+    }
+
+    async function scan() {
+      statusEl.textContent = 'Scanning...';
+      log('Starting scan...');
+      tbody.innerHTML = '';
+
+      try {
+        const tickers = await fetchJSON(`${FAPI}/fapi/v1/ticker/24hr`);
+        const usdtPairs = tickers.filter(t => 
+          t.symbol.endsWith('USDT') && 
+          !t.symbol.includes('UP') && 
+          !t.symbol.includes('DOWN') &&
+          !['USDCUSDT','BUSDUSDT','FDUSDUSDT','TUSDUSDT'].includes(t.symbol)
+        );
+        usdtPairs.sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
+        const candidates = usdtPairs.slice(0, TOP_N);
+        log(`Found ${usdtPairs.length} USDT pairs, scanning top ${candidates.length} by volume.`);
+
+        const picks = [];
+
+        for (const ticker of candidates) {
+          const symbol = ticker.symbol;
+          try {
+            const klines = await fetchJSON(`${FAPI}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=30`);
+            const closes = klines.map(k => parseFloat(k[4]));
+            const volumes = klines.map(k => parseFloat(k[5]));
+
+            const lastPrice = closes[closes.length - 1];
+            const avgVol = volumes.slice(0, -1).reduce((a, b) => a + b, 0) / (volumes.length - 1);
+            const curVol = volumes[volumes.length - 1];
+            const volAccel = avgVol > 0 ? curVol / avgVol : 0;
+
+            const priceChange = ((lastPrice - closes[0]) / closes[0]) * 100;
+            const rsi = calcRSI(closes);
+
+            let score = 0;
+            score += volAccel * 20;
+            score += priceChange * 2;
+            if (rsi > 50) score += 10;
+            if (rsi > 70) score -= 5;
+
+            const signal = (volAccel > 1.5 && priceChange > 0.5 && rsi > 40) ? 'PICK' : 'SKIP';
+            const tp = lastPrice * 1.02;
+            const sl = lastPrice * 0.98;
+
+            const row = {
+              symbol,
+              price: lastPrice,
+              change24h: parseFloat(ticker.priceChangePercent),
+              volAccel,
+              rsi,
+              score,
+              signal,
+              tp,
+              sl
+            };
+
+            if (signal === 'PICK') {
+              picks.push(row);
+              log(`✅ PICK: ${symbol} | VolAccel: ${volAccel.toFixed(2)} | RSI: ${rsi.toFixed(1)} | Score: ${score.toFixed(1)}`);
+            } else {
+              log(`   SKIP: ${symbol} | VolAccel: ${volAccel.toFixed(2)} | RSI: ${rsi.toFixed(1)}`);
+            }
+
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td>${symbol}</td>
+              <td>${lastPrice.toFixed(4)}</td>
+              <td class="${row.change24h >= 0 ? 'positive' : 'negative'}">${row.change24h.toFixed(2)}%</td>
+              <td>${volAccel.toFixed(2)}</td>
+              <td>${rsi.toFixed(1)}</td>
+              <td>${score.toFixed(1)}</td>
+              <td class="${signal === 'PICK' ? 'pick' : 'skip'}">${signal}</td>
+              <td>${tp.toFixed(4)}</td>
+              <td>${sl.toFixed(4)}</td>
+            `;
+            tbody.appendChild(tr);
+
+            await new Promise(r => setTimeout(r, 50));
+          } catch (e) {
+            log(`⚠️ Error scanning ${symbol}: ${e.message}`);
+          }
+        }
+
+        localStorage.setItem('momentum_picks', JSON.stringify(picks, null, 2));
+        log(`Scan complete. ${picks.length} picks saved to localStorage.`);
+        statusEl.textContent = `Done (${picks.length} picks)`;
+      } catch (e) {
+        log(`❌ Fatal error: ${e.message}`);
+        statusEl.textContent = 'Error';
+      }
+    }
+
+    document.getElementById('scanBtn').addEventListener('click', scan);
+
+    document.getElementById('autoBtn').addEventListener('click', (e) => {
+      if (autoInterval) {
+        clearInterval(autoInterval);
+        autoInterval = null;
+        e.target.textContent = 'Auto: OFF';
+        log('Auto-scan stopped.');
+      } else {
+        autoInterval = setInterval(scan, 30000);
+        e.target.textContent = 'Auto: ON';
+        log('Auto-scan started (every 30s).');
+        scan();
+      }
+    });
+
+    document.getElementById('downloadBtn').addEventListener('click', () => {
+      const data = localStorage.getItem('momentum_picks') || '[]';
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'momentum_picks.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
